@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+streamlit.log
+response.html
+.streamlit/
+
+# Generated at runtime by run.py/app.py (test_designer/executor/judge/report) --
+# not source, and may contain real Agent API transcripts / customer-adjacent data.
+results/
+transcripts/

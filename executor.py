@@ -20,20 +20,67 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import config
+import logging_setup
+import model_client
 from agent_api_client import AgentApiClient, AgentApiError
+from resilience import ModelCallError
 from schemas import BULK_CATEGORIES, EXECUTION_RESULT_SCHEMA, validate
 
+log = logging_setup.get_logger("executor")
+
 RUN_CSV_FIELDS = ["run_id", "test_id", "repetition", "timestamp", "actual_topic", "actual_action", "actual_response_summary", "execution_status", "transcript_path"]
+
+# Hard cap on turns in a multi_turn conversation test, so a looping or evasive
+# agent (or a customer LLM that won't stop) can't run forever. Mirrors the
+# agent-test-framework's turn-limit loop protection.
+MAX_CONVERSATION_TURNS = 8
+
+
+def _non_text_actions(messages: list[dict]) -> list[dict]:
+    """The actions/tools the agent invoked -- every message that isn't plain
+    conversational text."""
+    return [m for m in messages if m.get("type") not in ("Text", "Inform")]
+
+
+def _transcript_path(run_id: str, test_id: str, repetition: int) -> str:
+    path = os.path.join(config.TRANSCRIPTS_DIR, run_id, f"{test_id}_rep{repetition}.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
+def _error_result(case: dict, run_id: str, repetition: int, transcript_path: str, exc: Exception) -> dict:
+    return {
+        "test_id": case["test_id"],
+        "run_id": run_id,
+        "repetition": repetition,
+        "execution_status": "ERROR",
+        "actual_topic": "",
+        "actual_action": "",
+        "final_response": "",
+        "actions_taken": [],
+        "transcript_path": transcript_path,
+        "error_detail": str(exc),
+    }
+
+
+def _finalize(case: dict, result: dict, transcript_path: str) -> dict:
+    validate(result, EXECUTION_RESULT_SCHEMA)
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        json.dump({"test_case": case, "result": result}, f, indent=2, default=str)
+    return result
 
 
 def run_test_case(case: dict, run_id: str, client: AgentApiClient, repetition: int = 1) -> dict:
     """Runs one (test case, repetition) pair end to end against the live agent
-    and returns an ExecutionResult-shaped dict. Any Agent API failure is
-    captured as execution_status=ERROR rather than raised, so one bad
-    execution doesn't kill the whole bulk run."""
+    and returns an ExecutionResult-shaped dict. Dispatches to the multi-turn
+    conversation runner when the case declares conversation_mode=multi_turn.
+    Any Agent API failure is captured as execution_status=ERROR rather than
+    raised, so one bad execution doesn't kill the whole bulk run."""
+    if (case.get("conversation_mode") or "").strip() == "multi_turn":
+        return run_conversation(case, run_id, client, repetition)
+
     test_id = case["test_id"]
-    transcript_path = os.path.join(config.TRANSCRIPTS_DIR, run_id, f"{test_id}_rep{repetition}.json")
-    os.makedirs(os.path.dirname(transcript_path), exist_ok=True)
+    transcript_path = _transcript_path(run_id, test_id, repetition)
 
     try:
         session_id = client.start_session()
@@ -44,7 +91,7 @@ def run_test_case(case: dict, run_id: str, client: AgentApiClient, repetition: i
 
         messages = response.get("messages", [])
         final_message = messages[-1] if messages else {}
-        actions_taken = [m for m in messages if m.get("type") not in ("Text", "Inform")]
+        actions_taken = _non_text_actions(messages)
 
         result = {
             "test_id": test_id,
@@ -57,24 +104,94 @@ def run_test_case(case: dict, run_id: str, client: AgentApiClient, repetition: i
             "actions_taken": actions_taken,
             "transcript_path": transcript_path,
         }
-    except AgentApiError as exc:
+    except Exception as exc:  # isolate ANY failure as an ERROR row, never abort the batch
+        log.warning("execution error for %s rep%d: %s", test_id, repetition, exc)
+        result = _error_result(case, run_id, repetition, transcript_path, exc)
+
+    return _finalize(case, result, transcript_path)
+
+
+def run_conversation(case: dict, run_id: str, client: AgentApiClient, repetition: int = 1) -> dict:
+    """Runs one multi_turn conversation: the `utterance` seeds the first turn,
+    then model_client.call_customer role-plays the customer for each subsequent
+    turn following the case's `scenario`, until the customer stops or
+    MAX_CONVERSATION_TURNS is reached. One Agent API session spans all turns,
+    with an incrementing sequenceId. Produces the same ExecutionResult shape as
+    a single-turn run, plus a `turns` list; final_response is the agent's last
+    message and actions_taken is the union of actions across all turns."""
+    test_id = case["test_id"]
+    transcript_path = _transcript_path(run_id, test_id, repetition)
+    scenario = case.get("scenario") or case.get("utterance", "")
+
+    try:
+        turns: list[dict] = []
+        history: list[dict] = []
+        all_actions: list[dict] = []
+        actual_topic = ""
+        actual_action = ""
+        final_response = ""
+
+        session_id = client.start_session()
+        try:
+            for turn_no in range(1, MAX_CONVERSATION_TURNS + 1):
+                if turn_no == 1 and (case.get("utterance") or "").strip():
+                    user_msg = case["utterance"].strip()
+                else:
+                    try:
+                        customer = model_client.call_customer(scenario, history)
+                    except ModelCallError as exc:
+                        # The customer-simulator model failed mid-conversation.
+                        # If we already have turns, grade what we gathered; if not,
+                        # re-raise so this becomes an ERROR row (nothing to grade).
+                        log.warning("customer model failed for %s at turn %d: %s", test_id, turn_no, exc)
+                        if turns:
+                            break
+                        raise
+                    if (customer.get("status") or "").strip() == "stop":
+                        break
+                    user_msg = (customer.get("message") or "").strip()
+                    if not user_msg:
+                        break
+
+                response = client.send_message(session_id, user_msg, sequence_id=turn_no)
+                messages = response.get("messages", [])
+                final_message = messages[-1] if messages else {}
+                turn_actions = _non_text_actions(messages)
+                all_actions.extend(turn_actions)
+
+                agent_text = final_message.get("message", "")
+                actual_topic = response.get("topicName") or final_message.get("topicName", "") or actual_topic
+                actual_action = response.get("actionName") or final_message.get("actionName", "") or actual_action
+                final_response = agent_text
+
+                turns.append({
+                    "sequence_id": turn_no,
+                    "customer": user_msg,
+                    "agent": agent_text,
+                    "actions": turn_actions,
+                    "topic": actual_topic,
+                })
+                history.append({"customer": user_msg, "agent": agent_text})
+        finally:
+            client.end_session(session_id)
+
         result = {
             "test_id": test_id,
             "run_id": run_id,
             "repetition": repetition,
-            "execution_status": "ERROR",
-            "actual_topic": "",
-            "actual_action": "",
-            "final_response": "",
-            "actions_taken": [],
+            "execution_status": "OK",
+            "actual_topic": actual_topic,
+            "actual_action": actual_action,
+            "final_response": final_response,
+            "actions_taken": all_actions,
             "transcript_path": transcript_path,
-            "error_detail": str(exc),
+            "turns": turns,
         }
+    except Exception as exc:  # isolate ANY failure as an ERROR row, never abort the batch
+        log.warning("conversation error for %s rep%d: %s", test_id, repetition, exc)
+        result = _error_result(case, run_id, repetition, transcript_path, exc)
 
-    validate(result, EXECUTION_RESULT_SCHEMA)
-    with open(transcript_path, "w", encoding="utf-8") as f:
-        json.dump({"test_case": case, "result": result}, f, indent=2, default=str)
-    return result
+    return _finalize(case, result, transcript_path)
 
 
 def _repetitions_for(case: dict, repetitions: int) -> int:
@@ -102,14 +219,27 @@ def run_bulk(cases: list[dict], run_id: str, concurrency: int = None, repetition
     results = [None] * len(jobs)
 
     def _worker(idx: int, case: dict, rep: int) -> tuple[int, dict]:
-        client = AgentApiClient()
-        return idx, run_test_case(case, run_id, client, repetition=rep)
+        # Belt-and-suspenders: run_test_case already isolates its own failures,
+        # but creating the client (which resolves `sf` auth) can also raise, so
+        # the whole worker is guarded -- one bad job must never abort the batch.
+        try:
+            client = AgentApiClient()
+            return idx, run_test_case(case, run_id, client, repetition=rep)
+        except Exception as exc:
+            log.warning("worker failed for %s rep%d: %s", case.get("test_id"), rep, exc)
+            path = _transcript_path(run_id, case["test_id"], rep)
+            return idx, _finalize(case, _error_result(case, run_id, rep, path, exc), path)
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [pool.submit(_worker, i, case, rep) for i, (case, rep) in enumerate(jobs)]
         for future in as_completed(futures):
-            idx, result = future.result()
-            results[idx] = result
+            try:
+                idx, result = future.result()
+                results[idx] = result
+            except Exception as exc:  # should not happen (worker is guarded), but never crash the run
+                log.error("unexpected worker crash, continuing: %s", exc)
+
+    results = [r for r in results if r is not None]
 
     os.makedirs(config.RESULTS_DIR, exist_ok=True)
     run_csv_path = os.path.join(config.RESULTS_DIR, f"run_{run_id}.csv")

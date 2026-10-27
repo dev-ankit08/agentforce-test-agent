@@ -16,6 +16,17 @@ TEST_CASE_SCHEMA = {
         "expected_outcome": {"type": "string"},
         "category": {"type": "string", "enum": ["happy_path", "negative", "edge_case", "adversarial"]},
         "ac_id": {"type": "string"},
+        # --- Optional fields (not required, so every existing CSV still validates) ---
+        # conversation_mode: "" / "single_turn" (default) runs the utterance once;
+        # "multi_turn" drives a conversation where an LLM role-plays the customer
+        # following `scenario`. See executor.run_conversation / model_client.call_customer.
+        "conversation_mode": {"type": "string"},
+        "scenario": {"type": "string"},
+        # Deterministic trace assertions (no LLM). "->" separated; "..." is a wildcard
+        # matching any run of actions. See assertions.py. When present, these are a hard
+        # gate checked before the LLM judge.
+        "expected_actions": {"type": "string"},
+        "expected_action_path": {"type": "string"},
     },
 }
 
@@ -40,6 +51,9 @@ EXECUTION_RESULT_SCHEMA = {
         "actions_taken": {"type": "array", "items": {"type": "object"}},
         "transcript_path": {"type": "string"},
         "error_detail": {"type": "string"},
+        # Present only for multi_turn executions: the ordered list of
+        # {sequence_id, customer, agent, actions, topic} turn records.
+        "turns": {"type": "array", "items": {"type": "object"}},
     },
 }
 
@@ -54,6 +68,9 @@ JUDGE_VERDICT_SCHEMA = {
         "topic_match": {"type": "boolean"},
         "action_match": {"type": "boolean"},
         "rationale": {"type": "string"},
+        # Set when a deterministic trace assertion ran (assertions.py); describes
+        # which expected_actions / expected_action_path checks passed or failed.
+        "assertion_detail": {"type": "string"},
     },
 }
 

@@ -26,10 +26,18 @@ import uuid
 import requests
 
 import config
+import logging_setup
+from resilience import ModelCallError, with_retries
+
+log = logging_setup.get_logger("agent_api")
 
 
 class AgentApiError(Exception):
     """Raised for any failure talking to the Agent API or resolving `sf` auth."""
+
+
+class _TransientHTTP(Exception):
+    """Internal: a retryable Agent API response (429 / 5xx) or network blip."""
 
 
 def _resolve_sf_executable() -> str:
@@ -93,41 +101,66 @@ class AgentApiClient:
             raise AgentApiError("AGENTFORCE_AGENT_API_NAME is not set in .env")
         self.access_token, self.instance_url = _org_credentials(self.org_alias)
         self._base = f"{self.instance_url}/einstein/ai-agent/{config.AGENT_API_VERSION}"
-        self._headers = {
+        self._session = requests.Session()
+        self._session.headers.update({
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
-        }
+        })
+
+    def _request(self, method: str, url: str, *, what: str, **kwargs) -> requests.Response:
+        """One HTTP call with retry/backoff on 429/5xx and network blips. A
+        non-retryable error status (e.g. 4xx) raises AgentApiError immediately;
+        retries that exhaust also raise AgentApiError."""
+        def _do() -> requests.Response:
+            try:
+                resp = self._session.request(method, url, timeout=config.AGENT_API_TIMEOUT_SECONDS, **kwargs)
+            except requests.exceptions.RequestException as exc:
+                raise _TransientHTTP(f"{what}: network error: {exc}") from exc
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise _TransientHTTP(f"{what} failed ({resp.status_code}): {resp.text}")
+            if resp.status_code >= 300:
+                raise AgentApiError(f"{what} failed ({resp.status_code}): {resp.text}")
+            return resp
+
+        try:
+            return with_retries(
+                _do,
+                attempts=config.AGENT_API_RETRY_ATTEMPTS,
+                base_delay=config.AGENT_API_RETRY_BASE_DELAY,
+                retry_on=(_TransientHTTP,),
+            )
+        except ModelCallError as exc:
+            raise AgentApiError(str(exc)) from exc
 
     def start_session(self) -> str:
-        resp = requests.post(
-            f"{self._base}/agents/{self.agent_api_name}/sessions",
-            headers=self._headers,
+        resp = self._request(
+            "POST", f"{self._base}/agents/{self.agent_api_name}/sessions", what="start_session",
             json={
                 "externalSessionKey": str(uuid.uuid4()),
                 "instanceConfig": {"endpoint": self.instance_url},
                 "streamingCapabilities": {"chunkTypes": ["Text"]},
                 "bypassUser": True,
             },
-            timeout=config.AGENT_API_TIMEOUT_SECONDS,
         )
-        if resp.status_code >= 300:
-            raise AgentApiError(f"start_session failed ({resp.status_code}): {resp.text}")
         return resp.json()["sessionId"]
 
     def send_message(self, session_id: str, text: str, sequence_id: int) -> dict:
-        resp = requests.post(
-            f"{self._base}/sessions/{session_id}/messages",
-            headers=self._headers,
+        resp = self._request(
+            "POST", f"{self._base}/sessions/{session_id}/messages", what="send_message",
             json={"message": {"sequenceId": sequence_id, "type": "Text", "text": text}},
-            timeout=config.AGENT_API_TIMEOUT_SECONDS,
         )
-        if resp.status_code >= 300:
-            raise AgentApiError(f"send_message failed ({resp.status_code}): {resp.text}")
         return resp.json()
 
     def end_session(self, session_id: str) -> None:
-        requests.delete(
-            f"{self._base}/sessions/{session_id}",
-            headers={**self._headers, "x-session-end-reason": "UserRequest"},
-            timeout=config.AGENT_API_TIMEOUT_SECONDS,
-        )
+        # Best-effort cleanup: log a non-2xx instead of silently ignoring it, but
+        # never raise -- failing to end a session shouldn't fail the test.
+        try:
+            resp = self._session.delete(
+                f"{self._base}/sessions/{session_id}",
+                headers={"x-session-end-reason": "UserRequest"},
+                timeout=config.AGENT_API_TIMEOUT_SECONDS,
+            )
+            if resp.status_code >= 300:
+                log.warning("end_session for %s returned %d: %s", session_id, resp.status_code, resp.text[:200])
+        except requests.exceptions.RequestException as exc:
+            log.warning("end_session for %s failed: %s", session_id, exc)

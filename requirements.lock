@@ -1,0 +1,12 @@
+# Pinned, reproducible install for scheduled/production runs.
+# Regenerate on your target platform with:
+#   python -m venv .venv && . .venv/bin/activate
+#   pip install -e . && pip freeze --exclude-editable > requirements.lock
+#
+# The versions below are a known-good baseline (direct deps only); run the
+# command above to capture the full, platform-exact transitive closure.
+anthropic==0.40.0
+requests==2.32.3
+python-dotenv==1.0.1
+streamlit==1.38.0
+pandas==2.2.3

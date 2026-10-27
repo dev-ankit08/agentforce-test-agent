@@ -19,9 +19,13 @@ You need three things before you can run a real test:
 Then, in this folder:
 
 ```
-pip install -r requirements.txt
+pip install -e .          # or: pip install -r requirements.txt
 copy .env.example .env
 ```
+
+(`pip install -e .` also installs the `agentforce-test` command used in
+section 5. For a locked, reproducible environment, use
+`pip install -r requirements.lock`.)
 
 Open `.env` in a text editor and fill in:
 
@@ -125,14 +129,63 @@ After every AgentScript deploy:
 
 ## 5. If you'd rather use the terminal
 
-Everything the app does is also a CLI command (`run.py`), in case you want
-to script this into something else later:
+Everything the app does is also a CLI command. After `pip install -e .` you
+can use the `agentforce-test` command (or `python run.py` with the same
+arguments):
 
 ```
-python run.py design  --story story.txt --out test_cases.csv
-python run.py execute --cases test_cases.csv
-python run.py report  --run <run_id>
+agentforce-test design  --story story.txt --out test_cases.csv
+agentforce-test execute --cases test_cases.csv
+agentforce-test report  --run <run_id>
+agentforce-test run     --cases test_cases.csv     # one-shot: execute + report
+agentforce-test doctor                             # check your setup is valid
 ```
+
+Run **`agentforce-test doctor`** any time to confirm your API key, org
+alias, agent API name, and `sf` org connection are all good -- handy before
+a scheduled run.
+
+### Unattended / scheduled runs
+
+For a nightly job (or any script that needs to know pass/fail), `execute`
+and `run` can **exit non-zero** so the scheduler can alert you:
+
+- `--fail-on regression` (the default) -- fail the run if any test that used
+  to pass now fails, compared to the previous run of the same file.
+- `--fail-on failure` -- also fail on any failed or infra-errored execution.
+- `--fail-under 90` -- fail if the overall pass rate drops below 90%.
+- `--json` -- print a compact machine-readable summary instead of the full
+  report (easy to grep in logs).
+
+Example nightly cron line:
+
+```
+0 2 * * *  cd /path/to/agentforce-test-agent && \
+  agentforce-test run --cases example_cases.csv --fail-on regression --json \
+  >> logs/nightly.jsonl 2>&1 || notify-me "agentforce regression"
+```
+
+Each run also drops a `results/run_meta_<run_id>.json` recording the tool
+version, git commit, timings, and a result summary -- useful when reviewing
+what a scheduled run did days later. See `README.md` for a launchd (macOS)
+variant and the full flag list.
+
+### Advanced test-case fields (optional)
+
+Beyond the basic columns, a test case can carry:
+
+- `conversation_mode = multi_turn` + a `scenario` -- Claude plays a customer
+  with that persona/goal and holds a short back-and-forth with the agent,
+  instead of a single message.
+- `expected_actions` -- a `->`-separated list of actions that must all have
+  been invoked.
+- `expected_action_path` -- an ordered sequence the agent's actions must
+  match, where `...` means "any actions may come in between". If the path
+  doesn't match, the case fails immediately without spending a grading call.
+
+`example_cases.csv` shows one of each. You can also keep an optional
+`aliases.json` to treat renamed topics/actions as equivalent when matching
+(see `README.md`).
 
 ## 6. There's no data here until you run something
 

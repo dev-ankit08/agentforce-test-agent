@@ -10,7 +10,22 @@ import json
 
 import anthropic
 
+import assertions
 import config
+from resilience import ModelCallError, with_retries  # noqa: F401  (ModelCallError re-exported for callers)
+
+
+def _transient_errors() -> tuple[type[BaseException], ...]:
+    """Anthropic SDK error classes worth retrying (rate limits, timeouts,
+    connection drops, 5xx), resolved defensively so an SDK rename can't break
+    import. A malformed-JSON response (json.JSONDecodeError) is also retried --
+    asking the model once more usually yields clean JSON."""
+    names = ["RateLimitError", "APIConnectionError", "APITimeoutError", "InternalServerError", "APIStatusError"]
+    types = tuple(getattr(anthropic, n) for n in names if hasattr(anthropic, n))
+    return (types or (Exception,)) + (json.JSONDecodeError,)
+
+
+_RETRY_ON = _transient_errors()
 
 DESIGNER_SYSTEM_PROMPT = """You are a test designer for an Agentforce (Salesforce AI agent) regression \
 test suite. Given a user story with numbered acceptance criteria, produce a JSON array of test cases.
@@ -39,10 +54,25 @@ Each test case object must have exactly these fields:
 
 Return ONLY a JSON array of these objects, no prose, no markdown fences."""
 
+CUSTOMER_SYSTEM_PROMPT = """You are role-playing a customer talking to a Salesforce Agentforce agent, \
+so that the agent can be tested. You will be given a SCENARIO describing your goal/persona and the \
+CONVERSATION SO FAR (the customer and agent messages exchanged). Produce the customer's next message to \
+drive the scenario forward realistically.
+
+Stay in character as the customer -- never act as the agent or the tester. Keep each message to what a \
+real customer would actually type. Stop as soon as the scenario's goal has been reached or it is clearly \
+stalled/refused; do not pad the conversation with filler turns.
+
+Return ONLY a JSON object with exactly these fields:
+  message (the customer's next message to the agent; empty string if you are stopping)
+  status ("continue" to keep going, or "stop" when the goal is reached or cannot be reached)"""
+
 JUDGE_SYSTEM_PROMPT = """You are grading a single Agentforce test case and auditing it for hallucinations \
 in one pass. You will be given the expected topic, expected action, expected outcome, the actual \
 transcript (which topic/action the agent used and its final response), and the full list of \
-actions/tools the agent actually invoked during the conversation, including what each one returned.
+actions/tools the agent actually invoked during the conversation, including what each one returned. \
+The transcript may be a single turn or a multi-turn conversation (a `turns` list, oldest first); when \
+present, grade against the whole conversation and the agent's final response.
 
 Grading: decide PASS or FAIL based on whether the actual behavior satisfies the expected outcome -- not \
 just whether the wording matches. Be strict: a response that is vague, evasive, or contradicts the \
@@ -87,14 +117,39 @@ def _extract_json(text: str):
     return json.loads(text.strip())
 
 
-def call_test_designer(story_text: str) -> list[dict]:
-    resp = _client().messages.create(
-        model=config.DESIGNER_MODEL,
-        max_tokens=4096,
-        system=DESIGNER_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"User story:\n\n{story_text}"}],
+def _call(model: str, max_tokens: int, system: str, user_content: str):
+    """One model call + JSON parse, wrapped in retry/backoff. Raises
+    ModelCallError if it can't succeed within config.MODEL_RETRY_ATTEMPTS so the
+    caller can isolate the failure instead of crashing the run."""
+    def _do():
+        resp = _client().messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        return _extract_json(resp.content[0].text)
+
+    return with_retries(
+        _do,
+        attempts=config.MODEL_RETRY_ATTEMPTS,
+        base_delay=config.MODEL_RETRY_BASE_DELAY,
+        retry_on=_RETRY_ON,
     )
-    return _extract_json(resp.content[0].text)
+
+
+def call_customer(scenario: str, history: list[dict]) -> dict:
+    """Role-plays the next customer message in a multi_turn conversation test.
+    `history` is the conversation so far (list of {customer, agent} turns).
+    Returns {message, status}."""
+    return _call(
+        config.CUSTOMER_MODEL, 1024, CUSTOMER_SYSTEM_PROMPT,
+        json.dumps({"scenario": scenario, "conversation_so_far": history}, indent=2),
+    )
+
+
+def call_test_designer(story_text: str) -> list[dict]:
+    return _call(config.DESIGNER_MODEL, 4096, DESIGNER_SYSTEM_PROMPT, f"User story:\n\n{story_text}")
 
 
 def call_judge(test_case: dict, execution_result: dict) -> dict:
@@ -107,13 +162,15 @@ def call_judge(test_case: dict, execution_result: dict) -> dict:
         "expected_outcome": test_case["expected_outcome"],
         "actual_topic": execution_result["actual_topic"],
         "actual_action": execution_result["actual_action"],
+        # Normalized (id-suffix/underscore/case-folded) names so the judge isn't
+        # tripped up by Salesforce developer-name formatting -- see assertions.py.
+        "expected_topic_normalized": assertions.normalize(test_case["expected_topic"]),
+        "actual_topic_normalized": assertions.normalize(execution_result["actual_topic"]),
+        "expected_action_normalized": assertions.normalize(test_case["expected_action"]),
+        "actual_action_normalized": assertions.normalize(execution_result["actual_action"]),
         "final_response": execution_result["final_response"],
         "actions_taken": execution_result["actions_taken"],
     }
-    resp = _client().messages.create(
-        model=config.JUDGE_MODEL,
-        max_tokens=3072,
-        system=JUDGE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": json.dumps(payload, indent=2)}],
-    )
-    return _extract_json(resp.content[0].text)
+    if execution_result.get("turns"):
+        payload["turns"] = execution_result["turns"]
+    return _call(config.JUDGE_MODEL, 3072, JUDGE_SYSTEM_PROMPT, json.dumps(payload, indent=2))

@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentforce-test-agent"
+dynamic = ["version"]
+description = "Bulk & regression testing for deployed Agentforce (AgentScript) agents: design, execute, judge, hallucination-audit, and regression-diff test cases."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+    "anthropic>=0.40.0",
+    "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
+    "streamlit>=1.38.0",
+    "pandas>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+agentforce-test = "run:main"
+
+[tool.setuptools]
+# Flat module layout (no package dir) -- list each top-level module explicitly.
+py-modules = [
+    "agent_api_client",
+    "app",
+    "assertions",
+    "calibrate_judge",
+    "config",
+    "executor",
+    "hallucination",
+    "judge",
+    "logging_setup",
+    "model_client",
+    "regression",
+    "report",
+    "resilience",
+    "run",
+    "schemas",
+    "test_designer",
+    "version",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "version.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep it light: pyflakes + a few bug-prone checks; not a style crusade.
+select = ["E", "F", "W", "B"]
+ignore = ["E501"]  # line length handled by formatter/line-length above

@@ -346,3 +346,29 @@ def generate(run_id: str, cases_file: str = "test_cases.csv") -> str:
     write_hallucination_worksheet(run_id, g2)
     write_report_md(run_id, terminal_text)
     return terminal_text
+
+
+def summarize(run_id: str, cases_file: str = "test_cases.csv") -> dict:
+    """Machine-readable headline numbers for a run -- used for CLI exit-code
+    policy (`--fail-on` / `--fail-under`) and the `--json` summary. Reads the
+    same CSVs as generate(); does not write anything."""
+    data = load_run(run_id, cases_file)
+    g0 = gate0_execution_integrity(data)
+    g1 = gate1_pass_rate(data)
+    gc = gate_consistency(data)
+    g2 = gate2_hallucination_scan(data)
+    greg = gate_regression(data)
+    return {
+        "run_id": run_id,
+        "cases_file": cases_file,
+        "executions_total": g0["total"],
+        "infra_failures": len(g0["infra_failures"]),
+        "graded": g1["valid_count"],
+        "passed": g1["pass_count"],
+        "failed": g1["fail_count"],
+        "pass_pct": round(g1["pass_pct"], 2),
+        "flaky_tests": len(gc["flaky"]),
+        "hallucinations_flagged": len(g2["flagged"]),
+        "regressions": len(greg["newly_failing"]),
+        "newly_passing": len(greg["newly_passing"]),
+    }
